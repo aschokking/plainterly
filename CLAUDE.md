@@ -16,9 +16,14 @@ pixels = more layers = brighter appearance. Typically 4-8 tonal levels at
 
 The bookmark has variable total thickness (this is intentional; see Design notes).
 
-Output files:
+Output files (when OpenSCAD is on PATH or in `C:\Program Files\OpenSCAD\`):
 - `heightmap.png` -- grayscale PNG consumed by OpenSCAD's `surface()` function
-- `bookmark.scad` -- OpenSCAD file with one body, ready to export as one STL
+- `bookmark.scad` -- OpenSCAD source with one body
+- `bookmark.stl` -- rendered mesh
+- `bookmark.3mf` -- BambuStudio project with the filament change pre-baked
+
+If OpenSCAD isn't found, the script just writes the PNG and SCAD; the user can
+render manually. `--no-3mf` skips the auto-render even when OpenSCAD is present.
 
 ## File structure
 
@@ -36,15 +41,18 @@ python bookmark_heightmap.py input.jpg [options]
 
 Key options:
 ```
---width   float   Bookmark width mm (default: 50)
---height  float   Bookmark height mm (default: 150)
---levels  int     Tonal levels, 2-8 (default: 6)
---layer   float   Layer height mm (default: 0.08)
---base    float   Base thickness mm (default: 0.8)
---contrast float  Contrast boost, >1.0 (default: 1.3)
---blur    float   Gaussian blur radius px (default: 0.5)
---invert          Flip dark/light mapping
---out     path    Output directory (default: .)
+--width       float  Bookmark width mm (default: 50)
+--height      float  Bookmark height mm (default: 150)
+--bin-layers  list   Layer count per tonal bin, comma-separated, ascending,
+                     starts at 0 (default: 0,1,2,3,4,5). Length sets the
+                     number of tonal bins (2-8). The last value is the
+                     number of physical layers at the brightest tone.
+--layer       float  Layer height mm (default: 0.08)
+--base        float  Base thickness mm (default: 0.8)
+--contrast    float  Contrast boost, >1.0 (default: 1.3)
+--blur        float  Gaussian blur radius px (default: 0.5)
+--invert             Flip dark/light mapping
+--out         path   Output directory (default: .)
 ```
 
 The script prints the layer number where the filament change should be inserted
@@ -53,14 +61,15 @@ The script prints the layer number where the filament change should be inserted
 ## Print workflow (Bambu X1C)
 
 1. Run script. Verify `heightmap.png` looks like a good posterized image.
-2. Open `bookmark.scad` in OpenSCAD, render (F6), Export STL.
-3. BambuStudio: import `bookmark.stl` as a new project.
-4. Filament 1 = dark, Filament 2 = light.
-5. Add a filament change at the layer the script printed
-   ("Add Pause/Filament Change" on the slicer's layer slider).
-   Below that layer = dark; above = light.
-6. Layer height: match `--layer` value used when generating.
-7. Supports: OFF.
+2. Double-click `bookmark.3mf` to open it in BambuStudio. The filament change
+   at z = `--base` mm is already set; you should see it as a marker on the
+   layer slider after slicing.
+3. Filament 1 = dark, Filament 2 = light (assign in BambuStudio's filament panel).
+4. Set the printer profile's layer height to match the script's `--layer`. The
+   script assumes uniform layers, so set initial layer height = layer height
+   for cleanest results (otherwise Bambu rounds the swap to the closest layer
+   boundary, which is usually fine but can be off by one).
+5. Supports: OFF.
 
 ## Known issues / future work
 
@@ -81,12 +90,6 @@ The current pipeline is: grayscale -> letterbox to bookmark aspect -> optional b
 - Edge enhancement before posterizing to keep fine linework crisp
 - Histogram equalization as an alternative to manual contrast adjustment
 - Auto-contrast that clips darkest/lightest N% of pixels
-
-### Project 3MF with filament change pre-baked
-Standard 3MF can bundle the mesh but Bambu's project format also stores the
-filament-change marker. Reverse-engineering that XML schema would let us output
-a single file the user just opens in BambuStudio with everything pre-set --
-no manual layer-change step.
 
 ### Potential GUI / web wrapper
 A small Gradio or Streamlit app would make this accessible without CLI familiarity.
@@ -127,6 +130,15 @@ that natural bbox to the requested dimensions and the result is always manifold.
 - Light filament is somewhat translucent, so stacking more layers reads as
   brighter against the dark substrate. This is what makes the multi-tone look
   work with only 2 filaments.
+
+### Tuning bin-layers for opacity
+A purely linear mapping (e.g. `0,1,2,3,4,5` at 0.08mm) tops out at 0.4mm of
+light filament -- often not opaque enough to fully obscure the dark base, so the
+brightest band reads similar to the second-brightest. Stretching the top of the
+curve (e.g. `0,1,2,3,5,8` -> 0.64mm at brightest) gives the highest tone enough
+thickness to fully saturate while preserving tight 1-layer steps in the dark/mid
+range where the gradient already reads well. If your calibration print shows the
+top two bands looking too similar, push the top value higher.
 
 ### Hardware specifics
 - The hole punch (4mm diameter, 7mm from top edge) matches standard bookmark

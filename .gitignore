@@ -1,5 +1,5 @@
 out/
-out_cal/
+out_*/
 __pycache__/
 *.pyc
 *.stl

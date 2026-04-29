@@ -8,6 +8,11 @@ See CLAUDE.md for the print workflow.
 from __future__ import annotations
 
 import argparse
+import shutil
+import subprocess
+import uuid
+import zipfile
+from datetime import date
 from pathlib import Path
 
 import numpy as np
@@ -17,12 +22,17 @@ PX_PER_MM = 3
 HOLE_DIAMETER_MM = 4.0
 HOLE_FROM_TOP_MM = 7.0
 
+OPENSCAD_CANDIDATES = [
+    r"C:\Program Files\OpenSCAD\openscad.exe",
+    r"C:\Program Files (x86)\OpenSCAD\openscad.exe",
+]
+
 
 def build_heightmap(
     src: Path,
     width_mm: float,
     height_mm: float,
-    levels: int,
+    bin_layers: list[int],
     contrast: float,
     blur: float,
     invert: bool,
@@ -53,14 +63,18 @@ def build_heightmap(
     arr = (arr - 0.5) * contrast + 0.5
     arr = np.clip(arr, 0.0, 1.0)
 
+    levels = len(bin_layers)
     quantized = np.floor(arr * levels).astype(np.int32)
     quantized = np.clip(quantized, 0, levels - 1)
 
     if invert:
         quantized = (levels - 1) - quantized
 
-    step = 255 // (levels - 1)
-    scaled = (quantized * step).astype(np.uint8)
+    top_layers = bin_layers[-1]
+    lut = np.array(
+        [round(b / top_layers * 255) for b in bin_layers], dtype=np.uint8
+    )
+    scaled = lut[quantized]
     return Image.fromarray(scaled, mode="L")
 
 
@@ -77,11 +91,11 @@ width          = {width};
 height         = {height};
 base_thickness = {base};
 layer_height   = {layer};
-levels         = {levels};
+top_layers     = {top_layers};
 hole_diameter  = {hole_d};
 hole_from_top  = {hole_y};
 
-surface_max_z = (levels - 1) * layer_height;
+surface_max_z = top_layers * layer_height;
 total_max_z   = base_thickness + surface_max_z;
 
 module hole() {{
@@ -112,7 +126,7 @@ def write_scad(
     height: float,
     base: float,
     layer: float,
-    levels: int,
+    top_layers: int,
 ) -> int:
     swap_layer = max(1, round(base / layer))
     content = SCAD_TEMPLATE.format(
@@ -120,7 +134,7 @@ def write_scad(
         height=height,
         base=base,
         layer=layer,
-        levels=levels,
+        top_layers=top_layers,
         swap_layer=swap_layer,
         hole_d=HOLE_DIAMETER_MM,
         hole_y=HOLE_FROM_TOP_MM,
@@ -129,22 +143,238 @@ def write_scad(
     return swap_layer
 
 
+def find_openscad() -> str | None:
+    found = shutil.which("openscad")
+    if found:
+        return found
+    for path in OPENSCAD_CANDIDATES:
+        if Path(path).exists():
+            return path
+    return None
+
+
+def render_stl(scad: Path, stl: Path, openscad_exe: str) -> None:
+    subprocess.run(
+        [openscad_exe, "-o", str(stl.resolve()), str(scad.name)],
+        check=True,
+        cwd=scad.parent,
+    )
+
+
+def parse_ascii_stl(
+    path: Path,
+) -> tuple[list[tuple[float, float, float]], list[tuple[int, int, int]]]:
+    verts: dict[tuple[float, float, float], int] = {}
+    tris: list[tuple[int, int, int]] = []
+    cur: list[int] = []
+    with open(path) as f:
+        for line in f:
+            stripped = line.strip()
+            if stripped.startswith("vertex"):
+                _, x, y, z = stripped.split()
+                v = (float(x), float(y), float(z))
+                idx = verts.get(v)
+                if idx is None:
+                    idx = len(verts)
+                    verts[v] = idx
+                cur.append(idx)
+                if len(cur) == 3:
+                    tris.append((cur[0], cur[1], cur[2]))
+                    cur = []
+    return list(verts), tris
+
+
+CONTENT_TYPES_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+ <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+ <Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/>
+</Types>
+"""
+
+ROOT_RELS_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+ <Relationship Target="/3D/3dmodel.model" Id="rel-1" Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/>
+</Relationships>
+"""
+
+MODEL_RELS_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+ <Relationship Target="/3D/Objects/object_1.model" Id="rel-1" Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/>
+</Relationships>
+"""
+
+def build_main_model_xml() -> str:
+    today = date.today().isoformat()
+    obj_uuid = str(uuid.uuid4())
+    comp_uuid = str(uuid.uuid4())
+    build_uuid = str(uuid.uuid4())
+    item_uuid = str(uuid.uuid4())
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<model unit="millimeter" xml:lang="en-US" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02" xmlns:BambuStudio="http://schemas.bambulab.com/package/2021" xmlns:p="http://schemas.microsoft.com/3dmanufacturing/production/2015/06" requiredextensions="p">
+ <metadata name="Application">BambuStudio-02.05.00.66</metadata>
+ <metadata name="BambuStudio:3mfVersion">1</metadata>
+ <metadata name="CreationDate">{today}</metadata>
+ <metadata name="ModificationDate">{today}</metadata>
+ <resources>
+  <object id="2" p:UUID="{obj_uuid}" type="model">
+   <components>
+    <component p:path="/3D/Objects/object_1.model" objectid="1" p:UUID="{comp_uuid}" transform="1 0 0 0 1 0 0 0 1 0 0 0"/>
+   </components>
+  </object>
+ </resources>
+ <build p:UUID="{build_uuid}">
+  <item objectid="2" p:UUID="{item_uuid}" transform="1 0 0 0 1 0 0 0 1 128 128 0" printable="1"/>
+ </build>
+</model>
+"""
+
+
+MODEL_SETTINGS_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<config>
+  <object id="2">
+    <metadata key="name" value="bookmark"/>
+    <metadata key="extruder" value="1"/>
+    <part id="1" subtype="normal_part">
+      <metadata key="name" value="bookmark"/>
+      <metadata key="matrix" value="1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1"/>
+    </part>
+  </object>
+  <plate>
+    <metadata key="plater_id" value="1"/>
+    <metadata key="filament_map_mode" value="Auto For Flush"/>
+    <metadata key="filament_maps" value="1 1"/>
+    <model_instance>
+      <metadata key="object_id" value="2"/>
+      <metadata key="instance_id" value="0"/>
+    </model_instance>
+  </plate>
+  <assemble>
+   <assemble_item object_id="2" instance_id="0" transform="1 0 0 0 1 0 0 0 1 128 128 0" offset="0 0 0" />
+  </assemble>
+</config>
+"""
+
+# Full Bambu project_settings.config -- a minimal subset isn't enough to enable
+# the layer-change UI, so we ship the full template extracted from a working
+# Bambu-saved sample. Lives next to this script.
+PROJECT_SETTINGS_TEMPLATE = Path(__file__).parent / "project_settings_template.json"
+
+FILAMENT_SEQUENCE_JSON = '{"plate_1":{"sequence":[]}}'
+
+SLICE_INFO_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<config>
+  <header>
+    <header_item key="X-BBL-Client-Type" value="slicer"/>
+    <header_item key="X-BBL-Client-Version" value="02.05.00.66"/>
+  </header>
+</config>
+"""
+
+
+def build_object_mesh_xml(
+    vertices: list[tuple[float, float, float]],
+    triangles: list[tuple[int, int, int]],
+) -> str:
+    v_lines = "\n".join(
+        f'     <vertex x="{x:.6f}" y="{y:.6f}" z="{z:.6f}"/>'
+        for x, y, z in vertices
+    )
+    t_lines = "\n".join(
+        f'     <triangle v1="{a}" v2="{b}" v3="{c}"/>' for a, b, c in triangles
+    )
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<model unit="millimeter" xml:lang="en-US" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">
+ <resources>
+  <object id="1" type="model">
+   <mesh>
+    <vertices>
+{v_lines}
+    </vertices>
+    <triangles>
+{t_lines}
+    </triangles>
+   </mesh>
+  </object>
+ </resources>
+</model>
+"""
+
+
+def build_custom_gcode_xml(top_z: float) -> str:
+    return f"""<?xml version="1.0" encoding="utf-8"?>
+<custom_gcodes_per_layer>
+<plate>
+<plate_info id="1"/>
+<layer top_z="{top_z}" type="2" extruder="2" color="#FFFFFF" extra="" gcode="tool_change"/>
+<mode value="MultiAsSingle"/>
+</plate>
+</custom_gcodes_per_layer>
+"""
+
+
+def write_3mf(out: Path, stl: Path, swap_top_z: float) -> None:
+    verts, tris = parse_ascii_stl(stl)
+    mesh_xml = build_object_mesh_xml(verts, tris)
+    custom_gcode = build_custom_gcode_xml(swap_top_z)
+
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml", CONTENT_TYPES_XML)
+        z.writestr("_rels/.rels", ROOT_RELS_XML)
+        z.writestr("3D/3dmodel.model", build_main_model_xml())
+        z.writestr("3D/_rels/3dmodel.model.rels", MODEL_RELS_XML)
+        z.writestr("3D/Objects/object_1.model", mesh_xml)
+        z.writestr("Metadata/model_settings.config", MODEL_SETTINGS_XML)
+        z.writestr(
+            "Metadata/project_settings.config",
+            PROJECT_SETTINGS_TEMPLATE.read_text(),
+        )
+        z.writestr("Metadata/filament_sequence.json", FILAMENT_SEQUENCE_JSON)
+        z.writestr("Metadata/slice_info.config", SLICE_INFO_XML)
+        z.writestr("Metadata/custom_gcode_per_layer.xml", custom_gcode)
+
+
+def parse_bin_layers(s: str) -> list[int]:
+    try:
+        layers = [int(x.strip()) for x in s.split(",") if x.strip()]
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            "--bin-layers must be comma-separated integers"
+        )
+    if not 2 <= len(layers) <= 8:
+        raise argparse.ArgumentTypeError("--bin-layers must have 2-8 entries")
+    if layers[0] != 0:
+        raise argparse.ArgumentTypeError("--bin-layers first value must be 0")
+    if any(layers[i] >= layers[i + 1] for i in range(len(layers) - 1)):
+        raise argparse.ArgumentTypeError(
+            "--bin-layers must be strictly increasing"
+        )
+    return layers
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("input", type=Path, help="Source image (any PIL-readable format)")
     p.add_argument("--width", type=float, default=50, help="Bookmark width mm")
     p.add_argument("--height", type=float, default=150, help="Bookmark height mm")
-    p.add_argument("--levels", type=int, default=6, help="Tonal levels, 2-8")
+    p.add_argument(
+        "--bin-layers",
+        type=parse_bin_layers,
+        default=[0, 1, 2, 3, 4, 5],
+        help="Layer count per tonal bin, comma-separated, ascending, "
+             "starts at 0 (default: 0,1,2,3,4,5)",
+    )
     p.add_argument("--layer", type=float, default=0.08, help="Layer height mm")
     p.add_argument("--base", type=float, default=0.8, help="Base thickness mm")
     p.add_argument("--contrast", type=float, default=1.3, help="Contrast boost, >1.0")
     p.add_argument("--blur", type=float, default=0.5, help="Gaussian blur radius px")
     p.add_argument("--invert", action="store_true", help="Flip dark/light mapping")
     p.add_argument("--out", type=Path, default=Path("."), help="Output directory")
+    p.add_argument(
+        "--no-3mf",
+        action="store_true",
+        help="Skip auto-rendering STL and 3MF (just write SCAD)",
+    )
     args = p.parse_args()
-
-    if args.levels < 2:
-        p.error("--levels must be >= 2")
 
     args.out.mkdir(parents=True, exist_ok=True)
 
@@ -152,7 +382,7 @@ def main() -> None:
         args.input,
         args.width,
         args.height,
-        args.levels,
+        args.bin_layers,
         args.contrast,
         args.blur,
         args.invert,
@@ -167,13 +397,33 @@ def main() -> None:
         args.height,
         args.base,
         args.layer,
-        args.levels,
+        args.bin_layers[-1],
     )
 
     print(f"wrote {hm_path}")
     print(f"wrote {scad_path}")
-    print(f"BambuStudio: add filament change at layer {swap_layer} "
-          f"(dark below, light above)")
+
+    if args.no_3mf:
+        print(f"BambuStudio: add filament change at layer {swap_layer} "
+              f"(dark below, light above)")
+        return
+
+    openscad = find_openscad()
+    if not openscad:
+        print("OpenSCAD not found; skipping STL/3MF (use --no-3mf to silence).")
+        print(f"BambuStudio: add filament change at layer {swap_layer} "
+              f"(dark below, light above)")
+        return
+
+    stl_path = args.out / "bookmark.stl"
+    print(f"rendering STL via {openscad}...")
+    render_stl(scad_path, stl_path, openscad)
+    print(f"wrote {stl_path}")
+
+    threemf_path = args.out / "bookmark.3mf"
+    write_3mf(threemf_path, stl_path, swap_top_z=args.base)
+    print(f"wrote {threemf_path}")
+    print("Open bookmark.3mf in BambuStudio; the filament change is pre-set.")
 
 
 if __name__ == "__main__":
