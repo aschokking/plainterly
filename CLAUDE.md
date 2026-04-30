@@ -41,18 +41,24 @@ python bookmark_heightmap.py input.jpg [options]
 
 Key options:
 ```
---width       float  Bookmark width mm (default: 50)
---height      float  Bookmark height mm (default: 150)
---bin-layers  list   Layer count per tonal bin, comma-separated, ascending,
-                     starts at 0 (default: 0,1,2,3,4,5). Length sets the
-                     number of tonal bins (2-8). The last value is the
-                     number of physical layers at the brightest tone.
---layer       float  Layer height mm (default: 0.08)
---base        float  Base thickness mm (default: 0.8)
---contrast    float  Contrast boost, >1.0 (default: 1.3)
---blur        float  Gaussian blur radius px (default: 0.5)
---invert             Flip dark/light mapping
---out         path   Output directory (default: .)
+--width            float  Bookmark width mm (default: 50)
+--height           float  Bookmark height mm (default: 150)
+--levels           int    Number of tonal bins, 2-8 (default: 6)
+--opacity-mm       float  Light-filament characteristic opacity length mm
+                          (default: 0.30; see "Calibrating opacity-mm" below)
+--max-saturation   float  Brightest tone's fraction of asymptotic
+                          saturation, 0<s<1 (default: 0.88)
+--bin-layers       list   Override: explicit comma-separated layer counts,
+                          ascending, starts at 0. When given, the three
+                          options above are ignored.
+--layer            float  Layer height mm (default: 0.08)
+--base             float  Base thickness mm (default: 0.8)
+--contrast         float  Contrast boost around mid-gray, >1.0 (default: 1.3)
+--auto-contrast    float  Percentile to clip on each end before stretching
+                          to full 0-1 range. 0 disables. (default: 1.0)
+--blur             float  Gaussian blur radius px (default: 0.5)
+--invert                  Flip dark/light mapping
+--out              path   Output directory (default: .)
 ```
 
 The script prints the layer number where the filament change should be inserted
@@ -85,11 +91,13 @@ heightmaps) or check heightmap.png manually. A quick matplotlib preview of the
 posterized image overlaid with tonal level bands would help iteration.
 
 ### Image preprocessing
-The current pipeline is: grayscale -> letterbox to bookmark aspect -> optional blur
--> contrast boost -> posterize. Could explore:
+Current pipeline: grayscale -> resize -> percentile-stretch (`--auto-contrast`)
+-> letterbox to bookmark aspect -> blur -> mid-gray contrast boost (`--contrast`)
+-> posterize via `--bin-layers`. The percentile stretch happens *before*
+letterboxing so the black padding doesn't skew the percentiles. Could still
+explore:
 - Edge enhancement before posterizing to keep fine linework crisp
-- Histogram equalization as an alternative to manual contrast adjustment
-- Auto-contrast that clips darkest/lightest N% of pixels
+- Histogram equalization as an alternative to percentile-based stretching
 
 ### Potential GUI / web wrapper
 A small Gradio or Streamlit app would make this accessible without CLI familiarity.
@@ -131,14 +139,63 @@ that natural bbox to the requested dimensions and the result is always manifold.
   brighter against the dark substrate. This is what makes the multi-tone look
   work with only 2 filaments.
 
-### Tuning bin-layers for opacity
-A purely linear mapping (e.g. `0,1,2,3,4,5` at 0.08mm) tops out at 0.4mm of
-light filament -- often not opaque enough to fully obscure the dark base, so the
-brightest band reads similar to the second-brightest. Stretching the top of the
-curve (e.g. `0,1,2,3,5,8` -> 0.64mm at brightest) gives the highest tone enough
-thickness to fully saturate while preserving tight 1-layer steps in the dark/mid
-range where the gradient already reads well. If your calibration print shows the
-top two bands looking too similar, push the top value higher.
+### Tonal bin spacing: the Beer-Lambert model
+Translucent light filament over a dark substrate behaves like any absorbing
+medium: perceived brightness asymptotes toward an "infinite stack" maximum as
+layer count grows, with diminishing returns. The model:
+
+```
+L(d) = L_max * (1 - exp(-d / tau))
+```
+
+where `tau` (`--opacity-mm`) is the filament's characteristic opacity length --
+roughly the thickness at which you reach 63% of asymptotic brightness. To get
+N **perceptually even** tonal steps from black to (s * L_max), invert:
+
+```
+d_i = -tau * ln(1 - s * i / (N - 1))
+```
+
+then snap each `d_i` to the nearest layer height. With defaults `tau=0.30`,
+`s=0.88`, `levels=6`, `layer=0.08` this produces `[0, 1, 2, 3, 5, 8]` -- tight
+single-layer steps in the dark/mid range, expanding to an 8-layer top so the
+brightest band is fully opaque against the dark base.
+
+A purely linear mapping (e.g. `0,1,2,3,4,5`) tops out at only 0.4mm of light
+filament -- usually not opaque enough, so the top two bands look identical.
+That's the symptom that the model is solving.
+
+### Calibrating opacity-mm
+The default `--opacity-mm 0.30` works well for typical white PLA on a black
+substrate, but `tau` varies per filament (silk vs matte vs translucent, white
+vs ivory vs beige). To dial it in for a specific filament pair:
+
+1. **Print a linear baseline.** Run with `--bin-layers 0,1,2,3,4,5,6,7,8`
+   (or similar wide range) on a simple gradient input. This gives you a
+   reference strip with one band per layer count.
+2. **Photograph under controlled lighting.** Diffuse, even illumination on a
+   neutral background. A phone camera in a well-lit room is fine; just keep
+   exposure locked. Avoid glossy reflections.
+3. **Measure mean brightness per band.** Use any image editor's color picker
+   or `np.mean()` on a cropped region. Record `(layer_count_i, brightness_i)`
+   pairs. Normalize so `brightness_0 = 0` (bare dark base) and the brightest
+   band approximates `L_max`.
+4. **Fit `tau`.** Either:
+   - **Quick estimate:** find the layer count `n*` where brightness reaches
+     ~63% of the maximum band's brightness. Then `tau ≈ n* * layer_height`.
+   - **Least-squares fit:** `scipy.optimize.curve_fit` of
+     `L(d) = L_max * (1 - exp(-d/tau))` against the measured points. More
+     accurate, especially if your print didn't actually hit asymptote.
+5. **Sanity check.** If the top two bands of your linear baseline look
+   identical, your true `tau` is **smaller** than the layer spacing implies
+   -- decrease it. If brightness scales nearly linearly with layer count
+   across the full range (no diminishing returns), `tau` is **larger** than
+   your max thickness -- increase `--max-saturation`, add more layers via
+   `--levels`, or accept that this filament is too translucent for clean
+   posterization.
+
+For most users, just trying the defaults on a real image first is the right
+move; only calibrate if the result looks off.
 
 ### Hardware specifics
 - The hole punch (4mm diameter, 7mm from top edge) matches standard bookmark

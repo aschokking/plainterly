@@ -8,6 +8,7 @@ See CLAUDE.md for the print workflow.
 from __future__ import annotations
 
 import argparse
+import math
 import shutil
 import subprocess
 import uuid
@@ -21,6 +22,9 @@ from PIL import Image, ImageFilter
 PX_PER_MM = 3
 HOLE_DIAMETER_MM = 4.0
 HOLE_FROM_TOP_MM = 7.0
+DEFAULT_LEVELS = 6
+DEFAULT_OPACITY_MM = 0.30
+DEFAULT_MAX_SATURATION = 0.88
 
 OPENSCAD_CANDIDATES = [
     r"C:\Program Files\OpenSCAD\openscad.exe",
@@ -36,6 +40,7 @@ def build_heightmap(
     contrast: float,
     blur: float,
     invert: bool,
+    auto_contrast: float,
 ) -> Image.Image:
     img = Image.open(src).convert("L")
 
@@ -52,6 +57,15 @@ def build_heightmap(
         new_w = max(1, int(round(target_h * img_ratio)))
 
     img = img.resize((new_w, new_h), Image.LANCZOS)
+
+    if auto_contrast > 0:
+        content = np.asarray(img, dtype=np.float32) / 255.0
+        lo = np.percentile(content, auto_contrast)
+        hi = np.percentile(content, 100 - auto_contrast)
+        if hi > lo:
+            content = np.clip((content - lo) / (hi - lo), 0.0, 1.0)
+            img = Image.fromarray((content * 255).astype(np.uint8), mode="L")
+
     canvas = Image.new("L", (target_w, target_h), 0)
     canvas.paste(img, ((target_w - new_w) // 2, (target_h - new_h) // 2))
     img = canvas
@@ -333,6 +347,42 @@ def write_3mf(out: Path, stl: Path, swap_top_z: float) -> None:
         z.writestr("Metadata/custom_gcode_per_layer.xml", custom_gcode)
 
 
+def derive_bin_layers(
+    levels: int,
+    opacity_mm: float,
+    max_saturation: float,
+    layer_height_mm: float,
+) -> list[int]:
+    """Beer-Lambert bins for perceptually even brightness steps.
+
+    Models reflectance as L(d) = L_max * (1 - exp(-d / opacity_mm)). To get N
+    evenly-spaced perceived steps from 0 to max_saturation * L_max, invert:
+        d_i = -opacity_mm * ln(1 - max_saturation * i / (N - 1))
+    Then snap each d_i to the nearest integer multiple of layer_height_mm.
+    """
+    if not 2 <= levels <= 8:
+        raise ValueError("levels must be 2-8")
+    if opacity_mm <= 0:
+        raise ValueError("opacity-mm must be positive")
+    if not 0 < max_saturation < 1:
+        raise ValueError("max-saturation must be in (0, 1) exclusive")
+
+    bins: list[int] = []
+    for i in range(levels):
+        frac = max_saturation * i / (levels - 1)
+        d = 0.0 if frac == 0 else -opacity_mm * math.log(1 - frac)
+        bins.append(round(d / layer_height_mm))
+
+    for i in range(1, len(bins)):
+        if bins[i] <= bins[i - 1]:
+            raise ValueError(
+                f"Derived bin_layers={bins} not strictly increasing at "
+                f"index {i}. Try fewer --levels, larger --max-saturation, "
+                f"smaller --opacity-mm, or finer --layer."
+            )
+    return bins
+
+
 def parse_bin_layers(s: str) -> list[int]:
     try:
         layers = [int(x.strip()) for x in s.split(",") if x.strip()]
@@ -357,15 +407,46 @@ def main() -> None:
     p.add_argument("--width", type=float, default=50, help="Bookmark width mm")
     p.add_argument("--height", type=float, default=150, help="Bookmark height mm")
     p.add_argument(
+        "--levels",
+        type=int,
+        default=DEFAULT_LEVELS,
+        help=f"Number of tonal bins, 2-8 (default: {DEFAULT_LEVELS}). "
+             "Ignored if --bin-layers is given.",
+    )
+    p.add_argument(
+        "--opacity-mm",
+        type=float,
+        default=DEFAULT_OPACITY_MM,
+        help=f"Light-filament characteristic opacity length in mm "
+             f"(default: {DEFAULT_OPACITY_MM}). See CLAUDE.md for "
+             "calibration. Ignored if --bin-layers is given.",
+    )
+    p.add_argument(
+        "--max-saturation",
+        type=float,
+        default=DEFAULT_MAX_SATURATION,
+        help=f"Brightest tone's fraction of asymptotic saturation, "
+             f"0<s<1 (default: {DEFAULT_MAX_SATURATION}). "
+             "Ignored if --bin-layers is given.",
+    )
+    p.add_argument(
         "--bin-layers",
         type=parse_bin_layers,
-        default=[0, 1, 2, 3, 4, 5],
-        help="Layer count per tonal bin, comma-separated, ascending, "
-             "starts at 0 (default: 0,1,2,3,4,5)",
+        default=None,
+        help="Explicit override: layer count per tonal bin, comma-separated, "
+             "ascending, starts at 0. When set, --levels/--opacity-mm/"
+             "--max-saturation are ignored.",
     )
     p.add_argument("--layer", type=float, default=0.08, help="Layer height mm")
     p.add_argument("--base", type=float, default=0.8, help="Base thickness mm")
     p.add_argument("--contrast", type=float, default=1.3, help="Contrast boost, >1.0")
+    p.add_argument(
+        "--auto-contrast",
+        type=float,
+        default=1.0,
+        help="Percentile to clip on each end before stretching to full range. "
+             "0 disables. Default 1.0 (clips brightest/darkest 1%% as outliers).",
+    )
     p.add_argument("--blur", type=float, default=0.5, help="Gaussian blur radius px")
     p.add_argument("--invert", action="store_true", help="Flip dark/light mapping")
     p.add_argument("--out", type=Path, default=Path("."), help="Output directory")
@@ -378,14 +459,29 @@ def main() -> None:
 
     args.out.mkdir(parents=True, exist_ok=True)
 
+    if args.bin_layers is None:
+        try:
+            bin_layers = derive_bin_layers(
+                args.levels,
+                args.opacity_mm,
+                args.max_saturation,
+                args.layer,
+            )
+        except ValueError as e:
+            p.error(str(e))
+        print(f"derived bin-layers: {','.join(str(b) for b in bin_layers)}")
+    else:
+        bin_layers = args.bin_layers
+
     hm = build_heightmap(
         args.input,
         args.width,
         args.height,
-        args.bin_layers,
+        bin_layers,
         args.contrast,
         args.blur,
         args.invert,
+        args.auto_contrast,
     )
     hm_path = args.out / "heightmap.png"
     hm.save(hm_path)
@@ -397,7 +493,7 @@ def main() -> None:
         args.height,
         args.base,
         args.layer,
-        args.bin_layers[-1],
+        bin_layers[-1],
     )
 
     print(f"wrote {hm_path}")
