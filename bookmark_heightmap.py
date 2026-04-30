@@ -180,6 +180,12 @@ def find_openscad() -> str | None:
     found = shutil.which("openscad")
     if found:
         return found
+    snapshots: list[Path] = []
+    for parent in (Path(r"C:\Program Files"), Path(r"C:\Program Files (x86)")):
+        if parent.exists():
+            snapshots.extend(parent.glob("OpenSCAD-*/openscad.exe"))
+    if snapshots:
+        return str(sorted(snapshots, reverse=True)[0])
     for path in OPENSCAD_CANDIDATES:
         if Path(path).exists():
             return path
