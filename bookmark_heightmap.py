@@ -41,6 +41,7 @@ def build_heightmap(
     blur: float,
     invert: bool,
     auto_contrast: float,
+    fit: str,
 ) -> Image.Image:
     img = Image.open(src).convert("L")
 
@@ -49,14 +50,26 @@ def build_heightmap(
 
     img_ratio = img.width / img.height
     target_ratio = target_w / target_h
-    if img_ratio > target_ratio:
-        new_w = target_w
-        new_h = max(1, int(round(target_w / img_ratio)))
-    else:
-        new_h = target_h
-        new_w = max(1, int(round(target_h * img_ratio)))
 
-    img = img.resize((new_w, new_h), Image.LANCZOS)
+    if fit == "cover":
+        if img_ratio > target_ratio:
+            new_h = target_h
+            new_w = max(1, int(round(target_h * img_ratio)))
+        else:
+            new_w = target_w
+            new_h = max(1, int(round(target_w / img_ratio)))
+        img = img.resize((new_w, new_h), Image.LANCZOS)
+        left = (new_w - target_w) // 2
+        top = (new_h - target_h) // 2
+        img = img.crop((left, top, left + target_w, top + target_h))
+    else:  # contain
+        if img_ratio > target_ratio:
+            new_w = target_w
+            new_h = max(1, int(round(target_w / img_ratio)))
+        else:
+            new_h = target_h
+            new_w = max(1, int(round(target_h * img_ratio)))
+        img = img.resize((new_w, new_h), Image.LANCZOS)
 
     if auto_contrast > 0:
         content = np.asarray(img, dtype=np.float32) / 255.0
@@ -66,9 +79,10 @@ def build_heightmap(
             content = np.clip((content - lo) / (hi - lo), 0.0, 1.0)
             img = Image.fromarray((content * 255).astype(np.uint8), mode="L")
 
-    canvas = Image.new("L", (target_w, target_h), 0)
-    canvas.paste(img, ((target_w - new_w) // 2, (target_h - new_h) // 2))
-    img = canvas
+    if fit == "contain":
+        canvas = Image.new("L", (target_w, target_h), 0)
+        canvas.paste(img, ((target_w - img.width) // 2, (target_h - img.height) // 2))
+        img = canvas
 
     if blur > 0:
         img = img.filter(ImageFilter.GaussianBlur(radius=blur))
@@ -107,13 +121,18 @@ base_thickness = {base};
 layer_height   = {layer};
 top_layers     = {top_layers};
 hole_diameter  = {hole_d};
-hole_from_top  = {hole_y};
+hole_inset     = {hole_y};
 
 surface_max_z = top_layers * layer_height;
 total_max_z   = base_thickness + surface_max_z;
 
+// Hole goes on the short edge (the "end" where the tassel hangs).
+// Portrait: hole at top short edge. Landscape: hole at right short edge.
 module hole() {{
-    translate([0, height/2 - hole_from_top, -1])
+    pos = (width > height)
+        ? [width/2 - hole_inset, 0]
+        : [0, height/2 - hole_inset];
+    translate([pos[0], pos[1], -1])
         cylinder(h = total_max_z + 2, d = hole_diameter, $fn = 64);
 }}
 
@@ -448,6 +467,15 @@ def main() -> None:
              "0 disables. Default 1.0 (clips brightest/darkest 1%% as outliers).",
     )
     p.add_argument("--blur", type=float, default=0.5, help="Gaussian blur radius px")
+    p.add_argument(
+        "--fit",
+        choices=["cover", "contain"],
+        default="cover",
+        help="How to fit source aspect to bookmark aspect. cover (default) "
+             "scales to fill and center-crops the overflow. contain scales "
+             "to fit and letterboxes with dark padding (use for calibration "
+             "prints where edge content matters).",
+    )
     p.add_argument("--invert", action="store_true", help="Flip dark/light mapping")
     p.add_argument("--out", type=Path, default=Path("."), help="Output directory")
     p.add_argument(
@@ -482,6 +510,7 @@ def main() -> None:
         args.blur,
         args.invert,
         args.auto_contrast,
+        args.fit,
     )
     hm_path = args.out / "heightmap.png"
     hm.save(hm_path)

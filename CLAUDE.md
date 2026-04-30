@@ -43,6 +43,10 @@ Key options:
 ```
 --width            float  Bookmark width mm (default: 50)
 --height           float  Bookmark height mm (default: 150)
+--fit              str    cover (default) scales source to fill bookmark and
+                          center-crops the overflow. contain scales to fit
+                          and letterboxes with dark padding -- use for
+                          calibration prints where edge content matters.
 --levels           int    Number of tonal bins, 2-8 (default: 6)
 --opacity-mm       float  Light-filament characteristic opacity length mm
                           (default: 0.30; see "Calibrating opacity-mm" below)
@@ -91,11 +95,17 @@ heightmaps) or check heightmap.png manually. A quick matplotlib preview of the
 posterized image overlaid with tonal level bands would help iteration.
 
 ### Image preprocessing
-Current pipeline: grayscale -> resize -> percentile-stretch (`--auto-contrast`)
--> letterbox to bookmark aspect -> blur -> mid-gray contrast boost (`--contrast`)
--> posterize via `--bin-layers`. The percentile stretch happens *before*
-letterboxing so the black padding doesn't skew the percentiles. Could still
-explore:
+Current pipeline: grayscale -> resize-and-fit (`--fit cover|contain`) ->
+percentile-stretch (`--auto-contrast`) -> letterbox if contain -> blur ->
+mid-gray contrast boost (`--contrast`) -> posterize via bin layers.
+
+The percentile stretch always runs on real image content, never on dark
+letterbox padding (which would skew percentiles toward zero). For `cover`,
+the crop happens before stretching since the cropped pixels are gone. For
+`contain`, the stretch runs on the resized-but-not-yet-padded image, then
+the canvas paste adds dark bars at level 0.
+
+Could still explore:
 - Edge enhancement before posterizing to keep fine linework crisp
 - Histogram equalization as an alternative to percentile-based stretching
 
